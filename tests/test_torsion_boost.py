@@ -119,7 +119,8 @@ def test_torch_forces_are_energy_gradient(tmp_path, monkeypatch, torsion_boost):
     # Match calculator units: calculator returns forces in "physical" units.
     # Autograd helper typically differentiates the *model-unit* energy.
     e_unit = float(params["model"]["params"].get("e_unit", 1.0))
-    f_ag = f_ag * e_unit
+    e_scale = float(params["model"]["params"].get("e_scale", 1.0))
+    f_ag = f_ag * (e_unit / e_scale)
 
     assert np.isfinite(f_calc).all()
     assert np.isfinite(f_ag).all()

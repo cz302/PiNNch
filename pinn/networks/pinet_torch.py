@@ -658,6 +658,77 @@ class ANNOutputTorch(nn.Module):
         return output
 
 
+class NLRouter(nn.Module):
+    def __init__(self, *, nl_pbc: nn.Module, nl_free: nn.Module, rc: float):
+        super().__init__()
+        self.rc = float(rc)
+        self.nl_pbc = nl_pbc         # your CellListNLBatched (PBC fast path)
+        self.nl_free = nl_free       # your CellListNLPyTorch (non-PBC + safe PBC fallback)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        coord: torch.Tensor,
+        *,
+        ind_1: torch.Tensor,
+        cell: Optional[torch.Tensor] = None,
+        rc: Optional[float] = None,
+        **kwargs,
+    ) -> Dict[str, torch.Tensor]:
+        rc_eff = self.rc if rc is None else float(rc)
+
+        # ---- Non-PBC: keep existing path ----
+        if cell is None:
+            return build_nl_celllist(
+                ind_1=ind_1,
+                coord=coord,
+                cell=None,
+                rc=rc_eff,
+                nl_builder=self.nl_free,
+            )
+
+        # ---- PBC: choose between batched (fast) vs CellListNLPyTorch (ASE-consistent fallback) ----
+        # 1) Compute per-structure min box length (only what we need for mic_ok)
+        #    We’ll be conservative: if anything looks non-orthorhombic, fall back.
+        try:
+            if cell.ndim == 2:
+                H = cell
+                offdiag = H - torch.diag(torch.diagonal(H))
+                if torch.max(torch.abs(offdiag)).item() > 1e-6:
+                    # triclinic-ish: batched builder doesn't support it; fallback
+                    return build_nl_celllist(ind_1=ind_1, coord=coord, cell=cell, rc=rc_eff, nl_builder=self.nl_free)
+                Lmin = float(torch.min(torch.abs(torch.diagonal(H))).item())
+                mic_ok = (rc_eff <= 0.5 * Lmin)
+            elif cell.ndim == 3:
+                # per-structure cells
+                H = cell
+                offdiag = H - torch.diag_embed(torch.diagonal(H, dim1=1, dim2=2))
+                if torch.max(torch.abs(offdiag)).item() > 1e-6:
+                    return build_nl_celllist(ind_1=ind_1, coord=coord, cell=cell, rc=rc_eff, nl_builder=self.nl_free)
+                L = torch.abs(torch.diagonal(H, dim1=1, dim2=2))  # (B,3)
+                Lmin = float(torch.min(L).item())
+                mic_ok = (rc_eff <= 0.5 * Lmin)
+            else:
+                # unexpected shape: fallback to robust path
+                return build_nl_celllist(ind_1=ind_1, coord=coord, cell=cell, rc=rc_eff, nl_builder=self.nl_free)
+
+        except Exception:
+            # If anything goes sideways, prefer correctness
+            return build_nl_celllist(ind_1=ind_1, coord=coord, cell=cell, rc=rc_eff, nl_builder=self.nl_free)
+
+        # 2) If MIC is safe, use batched (fast)
+        if mic_ok:
+            return self.nl_pbc(coord, ind_1=ind_1, cell=cell)
+
+        # 3) If MIC is NOT safe, fall back to CellListNLPyTorch, which already enumerates images ASE-style
+        return build_nl_celllist(
+            ind_1=ind_1,
+            coord=coord,
+            cell=cell,
+            rc=rc_eff,
+            nl_builder=self.nl_free,
+        )
+
 class PreprocessLayerTorch(nn.Module):
     """
     Preprocessing layer to build neighbor list + initial features.
@@ -680,69 +751,22 @@ class PreprocessLayerTorch(nn.Module):
           coord = frac @ cell.
     """
 
+    
     def __init__(self, atom_types: Sequence[int], rc: float) -> None:
         super().__init__()
         self.rc = float(rc)
         self.embed = AtomicOnehotTorch(atom_types)
 
-        # Single NL builder at the true cutoff
-        self.nl = CellListNLPyTorch(self.rc)
+        # PBC batched/vectorized NL
+        from pinn.torch.celllist_batched import CellListNLBatched, BatchedCellListConfig
+        self.nl_pbc = CellListNLBatched(BatchedCellListConfig(rc=rc))
+
+        # Non-PBC per-structure NL 
+        self.nl_free = CellListNLPyTorch(rc=rc)
+
+        # IMPORTANT: runtime expects preprocess.nl to exist
+        self.nl = NLRouter(nl_pbc=self.nl_pbc, nl_free=self.nl_free, rc=rc)
     
-    @torch.no_grad()
-    @torch.no_grad()
-    def _build_nl_celllist(
-        self,
-        ind_1: torch.Tensor,
-        coord: torch.Tensor,
-        cell,
-        *,
-        nl_builder: Optional[nn.Module] = None,
-    ) -> dict:
-        nl_builder = self.nl if nl_builder is None else nl_builder
-        if ind_1.dtype != torch.long:
-            ind_1 = ind_1.long()
-        batch = ind_1[:, 0] if ind_1.ndim == 2 else ind_1
-        cell_is_per_struct = (cell is not None and cell.ndim == 3)
-
-        ind2_list = []
-        shift_list = []
-
-        for b in batch.unique(sorted=True).tolist():
-            idx = (batch == b).nonzero(as_tuple=False).squeeze(1)
-            if idx.numel() == 0:
-                continue
-
-            coord_b = coord[idx]
-            if cell is None:
-                nl_b = nl_builder(coord_b, cell=None)
-            else:
-                H = cell[b] if cell_is_per_struct else cell
-                nl_b = nl_builder(coord_b, cell=H)
-
-            ind_2_local = nl_b["ind_2"]
-            if ind_2_local.numel() == 0:
-                continue
-
-            gi = idx[ind_2_local[:, 0]]
-            gj = idx[ind_2_local[:, 1]]
-            ind2_list.append(torch.stack([gi, gj], dim=1))
-
-            # NEW: carry shifts
-            if "shift" in nl_b:
-                shift_list.append(nl_b["shift"].to(dtype=torch.long, device=coord.device))
-            else:
-                shift_list.append(torch.zeros((ind_2_local.shape[0], 3), dtype=torch.long, device=coord.device))
-
-        if len(ind2_list) == 0:
-            return {
-                "ind_2": coord.new_zeros((0, 2), dtype=torch.long),
-                "shift": coord.new_zeros((0, 3), dtype=torch.long),
-            }
-
-        return {
-            "ind_2": torch.cat(ind2_list, dim=0),
-            "shift": torch.cat(shift_list, dim=0),
-        }
 
     @torch.no_grad()
     def _build_nl_free(self, ind_1: torch.Tensor, coord: torch.Tensor) -> dict:
@@ -868,25 +892,29 @@ class PreprocessLayerTorch(nn.Module):
     def forward(self, tensors: dict) -> dict:
         out = dict(tensors)
 
+        # --- atom one-hot ---
         if "prop" not in out:
             prop = self.embed(out["elems"])
             out["prop"] = prop.to(dtype=out["coord"].dtype)
 
+        # --- neighbor list (and shift for PBC) ---
         if "ind_2" not in out:
             cell = out.get("cell", None)
-            nl = build_nl_celllist(
-                ind_1=out["ind_1"],
-                coord=out["coord"],
-                cell=cell,
-                rc=self.rc,
-                nl_builder=self.nl,
-            )
-            out.update(nl)
+            nl = self.nl(out["coord"], ind_1=out["ind_1"], cell=cell)
+            out.update(nl)  # keep extra keys (e.g., shift), BUT see below
 
+            # CRITICAL: Never keep diff/dist produced by an NL builder (often no_grad),
+            # because forces require diff/dist to be computed from coord with autograd.
+            out.pop("diff", None)
+            out.pop("dist", None)
 
-        if "diff" not in out or "dist" not in out:
+        # --- edge vectors / distances (must be autograd-connected to coord) ---
+        if ("diff" not in out) or ("dist" not in out):
             cell = out.get("cell", None)
             shift = out.get("shift", None)
+
+            if cell is not None and shift is None:
+                raise KeyError("PBC batch has 'cell' but missing 'shift' (expected from NL builder).")
 
             diff, dist = compute_diff_dist(
                 coord=out["coord"],

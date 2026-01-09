@@ -296,6 +296,30 @@ class EquivarLayerTorch(nn.Module):
         self.pp = FFLayerTorch(pp_nodes, activation=None, use_bias=False) if len(pp_nodes) else nn.Identity()
         self.dot = DotLayerTorch()
 
+        # --- Knob A: learnable per-pair torsion relevance gate (scalar) ---
+        # We know i1 channel dim from pp_nodes used to build EquivarLayerTorch (ppx_nodes=[pp_nodes[-1]])
+        C = int(pp_nodes[-1])  # i1 has shape (n_pairs, C)
+
+        # Gate takes concat([i1, s]) where s is (n_pairs,1) -> input dim is C+1
+        self.tb_pair_gate = nn.Linear(C + 1, 1, bias=True)
+
+        #     Make i1 weights zero so the only initial driver is s.
+        with torch.no_grad():
+            nn.init.zeros_(self.tb_pair_gate.weight)      # (1, C+1)
+            self.tb_pair_gate.bias.fill_(-1.0)            # not -2.0 (too dead with temp>1)
+            self.tb_pair_gate.weight[0, -1] = 2.0         # positive weight on s channel
+
+        # Temperature: don’t go too sharp initially
+        self.tb_temp = 2.0   # try 2.0 first (then 3.0 if still not selective)
+
+        # TB channel adapter: keep it, init near identity
+        self.tb_proj = nn.Linear(C, C, bias=False)
+        with torch.no_grad():
+            nn.init.eye_(self.tb_proj.weight)
+
+        # Debug toggle (prefer False by default; enable from tests/params)
+        self.debug_tb = False
+
         # activation is kept in signature to stay API-compatible, but not used here (TF defines ii_layer but doesn't use it).
 
     def forward(
@@ -326,8 +350,55 @@ class EquivarLayerTorch(nn.Module):
                 raise ValueError("torsion_boost=True requires t3.")
             if fc_edge is None:
                 raise ValueError("torsion_boost=True requires tb_gate (fc_edge).")
-            # fc_edge is tb_gate: shape (n_pairs,1); broadcasts over channels
-            ix = ix + self._lift_dir(t3, i1 * fc_edge)
+            # --- Knob A: learned torsion relevance gate ---
+            # g_learn: (n_pairs, 1) in (0,1)
+            s = (t3 * t3).sum(dim=-1, keepdim=True)          # (n_pairs,1) relevance magnitude
+            s = s / (s.detach().mean() + 1e-6)               # dimensionless, mean ~ 1
+            gate_in = torch.cat([i1, s], dim=-1)
+            logit = self.tb_pair_gate(gate_in)          # (n_pairs,1)
+            g_learn = torch.sigmoid(self.tb_temp * logit)    
+
+            # fc_edge is tb_gate: (n_pairs, 1)
+            tb_eff = fc_edge * g_learn
+
+            # --- TB has its own channel mixing adapter W_tb ---
+
+            i_tb = self.tb_proj(i1)   # (n_pairs, C)
+
+            if self.debug_tb:
+                if tb_eff.numel() == 0:
+                    print("[TB] empty edge list (no pairs inside cutoff) — skipping TB stats")
+                else:
+                    # How alive is the geometric gate?
+                    tb_eff_mean = float(tb_eff.mean().detach().cpu())
+                    tb_eff_max  = float(tb_eff.max().detach().cpu())
+                    live_frac   = float((tb_eff > 1e-6).float().mean().detach().cpu())
+
+                    # How big is the TB message compared to the base directional message?
+                    msg_d3 = self._lift_dir(d3, i1)                  # (n_pairs,3,C)
+                    msg_tb = self._lift_dir(t3, i_tb * tb_eff)       # (n_pairs,3,C)
+
+                    # robust RMS for non-empty tensors
+                    d3_rms = float(msg_d3.pow(2).mean().sqrt().detach().cpu())
+                    tb_rms = float(msg_tb.pow(2).mean().sqrt().detach().cpu())
+                    ratio  = tb_rms / (d3_rms + 1e-12)
+
+                    print(
+                        f"[TB] tb_eff mean={tb_eff_mean:.3e} max={tb_eff_max:.3e} "
+                        f"live={live_frac*100:.1f}% | msg_rms tb/d3={ratio:.3e}"
+                    )
+
+                    g_mean = float(g_learn.mean().detach().cpu())
+                    g_max  = float(g_learn.max().detach().cpu())
+                    g_min  = float(g_learn.min().detach().cpu())
+
+                    # how close W_tb is to identity (if you initialized as identity)
+                    w = self.tb_proj.weight
+                    ident_err = float((w - torch.eye(w.shape[0], device=w.device, dtype=w.dtype)).pow(2).mean().sqrt().detach().cpu())
+
+                    print(f"[TB] g_learn mean={g_mean:.3e} min={g_min:.3e} max={g_max:.3e} | Wtb_rmse_from_I={ident_err:.3e}")
+
+            ix = ix + self._lift_dir(t3, i_tb * tb_eff)
 
         p3_new = self.ip(ind_2, p3, ix)
         p3_new = self.pp(p3_new) if not isinstance(self.pp, nn.Identity) else p3_new
@@ -363,7 +434,7 @@ class GCBlock2Torch(nn.Module):
         pp1_nodes = list(pp_nodes)
 
         ii1_nodes[-1] = int(ii1_nodes[-1]) * int(self.n_props)
-        pp1_nodes[-1] = int(ii_nodes[-1]) * int(self.n_props)
+        pp1_nodes[-1] = (int(ii_nodes[-1])) * int(self.n_props)
 
         self.invar_p1_layer = InvarLayerTorch(
             pp_nodes=pp_nodes,
@@ -406,6 +477,29 @@ class GCBlock2Torch(nn.Module):
                 fc_edge=tensors.get("tb_gate", None),
             )
             px_list.append(dotted_p3)
+
+            # --- Knob D: torsion invariant summary into scalar mixing ---
+            # Build an axial vector per pair: a_pair = (d3 x t3) * tb_gate
+            if self.equivar_p3_layer.torsion_boost:
+                t3 = tensors.get("t3_unit", None)
+                tb_gate = tensors.get("tb_gate", None)
+                if t3 is not None and tb_gate is not None and t3.numel() != 0:
+                    # axial per-pair vector (n_pairs,3)
+                    a_pair = torch.cross(tensors["d3"], t3, dim=-1) * tb_gate  # tb_gate (n_pairs,1) broadcasts
+
+                    # scatter to atoms i = ind_2[:,0] -> (n_atoms,3)
+                    i = ind_2[:, 0]
+                    n_atoms = int(tensors["p1"].shape[0])
+                    a_atom = torch.zeros((n_atoms, 3), dtype=a_pair.dtype, device=a_pair.device)
+                    a_atom.index_add_(0, i, a_pair)
+
+                    # invariant torsion scalar per atom: |a_atom|^2 -> (n_atoms,1)
+                    tau = (a_atom * a_atom).sum(dim=-1, keepdim=True)
+                else:
+                    # keep shapes consistent even if empty edge list
+                    tau = p1.new_zeros((p1.shape[0], 1))
+
+                px_list.append(tau)
 
         # 4) Second invariant mixing (per-atom): concat([p1, dotted_p3]) -> pp_layer -> split
         p1t1 = self.pp_layer(torch.cat(px_list, dim=-1))
@@ -536,6 +630,7 @@ class PiNet2Torch(nn.Module):
             tensors["tb_gate"] = tb_gate
         else:
             tensors.pop("t3", None)
+            tensors.pop("tb_gate", None)
 
         if self.rank >= 3 and "p3" not in tensors:
             tensors["p3"] = torch.zeros(
