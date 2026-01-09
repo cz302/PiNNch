@@ -252,8 +252,14 @@ def _iter_batches_from_examples(
         if len(batch_structs) == opts.batch_size:
             batch = _sparse_batch_structures(batch_structs)
 
-            # MUST come before preprocess so diff/dist depend on coord with grad
-            batch["coord"] = batch["coord"].requires_grad_(True)
+            coord = batch["coord"]
+            if not coord.is_floating_point():
+                batch["coord"] = coord.float()
+                coord = batch["coord"]
+
+            # IMPORTANT: in-place, keep identity
+            if not coord.requires_grad:
+                coord.requires_grad_(True)
 
             if opts.preprocess:
                 if nl_builder is None:
@@ -263,15 +269,24 @@ def _iter_batches_from_examples(
                     atom_types=opts.atom_types,
                     rc=opts.rc,
                     nl_builder=nl_builder,
+                    make_diff_dist=False,
                 )
 
-            batch["coord"] = batch["coord"].requires_grad_(True)
             yield batch
             batch_structs = []
 
     # flush remainder (useful for eval)
     if batch_structs:
         batch = _sparse_batch_structures(batch_structs)
+
+        coord = batch["coord"]
+        if not coord.is_floating_point():
+            batch["coord"] = coord.float()
+            coord = batch["coord"]
+
+        # IMPORTANT: in-place, keep identity
+        if not coord.requires_grad:
+            coord.requires_grad_(True)
 
         if opts.preprocess:
             if nl_builder is None:
@@ -283,7 +298,6 @@ def _iter_batches_from_examples(
                 nl_builder=nl_builder,
             )
 
-        batch["coord"] = batch["coord"].requires_grad_(True)
         yield batch
 
 

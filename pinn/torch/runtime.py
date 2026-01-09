@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from typing import Dict, Iterator, Optional
 from pinn.torch.optim import build_optimizer_from_params, apply_grad_clipping
-from pinn.torch.input_pipeline import TorchDataOptions, make_torch_dataloader_from_yml, _iter_batches_from_examples
+from pinn.torch.input_pipeline import TorchDataOptions, _iter_batches_from_examples
 from pinn.utils import init_params
 import yaml
 from torch.utils.tensorboard import SummaryWriter
@@ -25,6 +25,19 @@ class PotentialLossConfig:
     use_force: bool = True
     use_e_per_atom: bool = False
     log_e_per_atom: bool = False  # affects metrics/reporting only
+
+
+def maybe_compile_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Optionally compile the model for speed (PyTorch 2+)."""
+    if os.environ.get("PINN_TORCH_COMPILE", "0") != "1":
+        return model
+    return torch.compile(model, mode="max-autotune")
+
+def move_pinn_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+    out = {}
+    for k, v in batch.items():
+        out[k] = v.to(device, non_blocking=True) if torch.is_tensor(v) else v
+    return out
 
 def _ckpt_dir(model_dir: str) -> str:
     return os.path.join(model_dir, "checkpoints")
@@ -540,6 +553,7 @@ def train_and_evaluate(
                 dataset_role="eval",
             )
             built_eval = list(built_eval)
+            
 
         else:
             # Existing unit-test path: LJ toy numpy dict
@@ -602,12 +616,15 @@ def train_and_evaluate(
 
                 if use_yml_pipeline:
                     tensors = {k: v for k, v in batch.items() if k not in ("e_data", "f_data")}
-                    E_true = batch["e_data"]
-                    F_true = _flatten_forces(batch["f_data"])
+                    dev_t = next(model.parameters()).device
+                    tensors = move_pinn_batch_to_device(tensors, dev_t)
+                    E_true = batch["e_data"].to(dev_t, non_blocking=True)
+                    F_true = _flatten_forces(batch["f_data"]).to(dev_t, non_blocking=True)
+                    # enforce invariant for force autograd
                     coord = tensors["coord"]
-                    if not coord.requires_grad or not coord.is_leaf:
-                        coord = coord.detach().clone().requires_grad_(True)
-                        tensors["coord"] = coord
+                    if not coord.requires_grad:
+                        coord.requires_grad_(True)
+                    
                 else:
                     sb = _make_sparse_batch(batch, device=device)
                     tensors = {k: v for k, v in sb.items() if not k.startswith("_")}
@@ -661,13 +678,16 @@ def train_and_evaluate(
                 tensors = {k: v for k, v in batch.items() if k not in ("e_data", "f_data")}
                 if "e_data" not in batch or "f_data" not in batch:
                     raise KeyError("YAML Torch pipeline batch must include 'e_data' and 'f_data' for potential_model tests.")
-                E_true = batch["e_data"]
-                F_true = batch["f_data"]
-                F_true = _flatten_forces(F_true)
+                
+                dev_t = next(model.parameters()).device
+                tensors = move_pinn_batch_to_device(tensors, dev_t)
+                
+                E_true = batch["e_data"].to(dev_t, non_blocking=True)
+                F_true = _flatten_forces(batch["f_data"]).to(dev_t, non_blocking=True)
+                # enforce invariant for force autograd
                 coord = tensors["coord"]
-                if not coord.requires_grad or not coord.is_leaf:
-                    coord = coord.detach().clone().requires_grad_(True)
-                    tensors["coord"] = coord
+                if not coord.requires_grad:
+                    coord.requires_grad_(True)
             else:
                 # LJ numpy dict path
                 sb = _make_sparse_batch(batch, device=device)

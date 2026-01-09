@@ -26,6 +26,7 @@ import torch
 import pinn
 from pinn.io import load_numpy, write_tfrecord
 from pinn.torch.input_pipeline import TorchDataOptions, make_torch_dataloader_from_yml
+from pinn.torch.runtime import move_pinn_batch_to_device, maybe_compile_model
 
 
 def _find_aspirin_npz() -> Path:
@@ -114,12 +115,7 @@ def _torch_eval_mae_from_yml(
     eval_steps: int,
     batch_size_eval: int,
 ) -> tuple[float, float]:
-    """
-    Compute (energy_mae, force_mae_per_component) on the eval set using the torch YAML pipeline.
-    MAE is computed in the same label space as the runtime metrics:
-      E ensured comparable via E_pred/e_unit vs E_true
-      F via F_pred/e_unit vs F_true
-    """
+    """Compute (energy_mae, force_mae_per_component) on eval set (Torch YAML pipeline)."""
     mp = params.get("model", {}).get("params", {}) or {}
     e_unit = float(mp.get("e_unit", 1.0))
     use_force = bool(mp.get("use_force", True))
@@ -136,7 +132,7 @@ def _torch_eval_mae_from_yml(
         scratch_dir=scratch_dir,
         cache=True,
         cache_ram=True,
-        device=device,
+        device="cpu",   # CPU pipeline; move to GPU in this function
         preprocess=True,
     )
 
@@ -146,6 +142,9 @@ def _torch_eval_mae_from_yml(
     )
     eval_it = iter(eval_loader)
 
+    dev = torch.device(device)
+    if hasattr(model, "to"):
+        model.to(dev)
     if hasattr(model, "eval"):
         model.eval()
 
@@ -163,13 +162,16 @@ def _torch_eval_mae_from_yml(
         if "e_data" not in batch or "f_data" not in batch:
             raise KeyError("Torch YAML batch must include 'e_data' and 'f_data'.")
 
-        E_true = batch["e_data"]  # (B,)
-        F_true = batch["f_data"]  # (B*N,3) or (B,N,3)
+        # Labels to device
+        E_true = batch["e_data"].to(dev, non_blocking=True)
+        F_true = batch["f_data"].to(dev, non_blocking=True)
+
+        # Inputs to device + coord requires_grad on device (canonical)
         tensors = {k: v for k, v in batch.items() if k not in ("e_data", "f_data")}
-
+        tensors = move_pinn_batch_to_device(tensors, dev)
         coord = tensors["coord"]
-        coord.requires_grad_(True)
 
+        # Forward
         E_pred = model(tensors)
 
         # Accept (B,1) or (B,)
@@ -177,11 +179,12 @@ def _torch_eval_mae_from_yml(
             E_pred = E_pred[:, 0]
         elif E_pred.ndim != 1:
             raise ValueError(f"Expected E_pred shape (B,) or (B,1), got {tuple(E_pred.shape)}")
-        
-        
 
-        # Per-structure atom counts (B,)
-        B = int(E_true.shape[0])
+        # Number of structures
+        B = int(E_true.shape[0])  # ok for your current dataset
+        # Safer alternative (uncomment if you want):
+        # B = int(tensors["ind_1"][:, 0].max().item()) + 1
+
         counts = (
             torch.bincount(tensors["ind_1"][:, 0], minlength=B)
             .to(E_true.dtype)
@@ -201,7 +204,6 @@ def _torch_eval_mae_from_yml(
             if F_pred.ndim == 3:
                 F_pred = F_pred.reshape(-1, 3)
 
-            # Force MAE per-component in the same label space
             F_abs_sum += torch.abs((F_pred / e_unit) - F_true).sum().item()
             F_count += int(F_true.numel())
 
@@ -249,6 +251,7 @@ def test_aspirin_rmd17_torch_notebook_params_beats_zero_baseline(tmp_path, monke
                 "out_nodes": [16],
                 "rank": 3,
                 "rc": 4.5,
+                "torsion_boost": False,
             },
         },
         "optimizer": {
@@ -294,11 +297,12 @@ def test_aspirin_rmd17_torch_notebook_params_beats_zero_baseline(tmp_path, monke
 
     # ---- Train via torch runtime (YAML pipeline) ----
     model = pinn.get_model(params)
+    model = maybe_compile_model(model)
 
     num_train_steps = int(os.environ.get("ASPIRIN_TORCH_MAX_STEPS", "2000"))
     eval_steps = int(os.environ.get("ASPIRIN_TORCH_EVAL_STEPS", "200"))
-    batch_size_train = int(os.environ.get("ASPIRIN_TORCH_BATCH_TRAIN", "1"))
-    batch_size_eval = int(os.environ.get("ASPIRIN_TORCH_BATCH_EVAL", "1"))
+    batch_size_train = int(os.environ.get("ASPIRIN_TORCH_BATCH_TRAIN", "2"))
+    batch_size_eval = int(os.environ.get("ASPIRIN_TORCH_BATCH_EVAL", "2"))
     shuffle_buffer = int(os.environ.get("ASPIRIN_TORCH_SHUFFLE_BUFFER", "1000"))
 
     scratch_dir = str(tmp_path / "torch_cache")

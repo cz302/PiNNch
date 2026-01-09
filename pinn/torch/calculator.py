@@ -357,10 +357,28 @@ def get_calc(model_spec, **kwargs):
     build_params = ckpt_params if isinstance(ckpt_params, dict) else model_spec
 
     model = build_model(build_params).to(device)
-
+    
     # Support both formats: full dict checkpoint or raw state_dict
     state = ckpt.get("model_state_dict", ckpt)
-    model.load_state_dict(state)
+
+    # ... existing code that builds `model` and loads `state` from model.pt ...
+
+    strict = bool(kwargs.pop("strict", True))
+
+    # Existing line (currently strict=True implicitly):
+    # model.load_state_dict(state)
+
+    missing, unexpected = model.load_state_dict(state, strict=strict)
+
+    if (missing or unexpected):
+        # Keep the existing warning style you already use elsewhere in the repo
+        print("[checkpoint] Loaded into model:")
+        print(f"  missing keys   = {len(missing)}")
+        print(f"  unexpected keys= {len(unexpected)}")
+        if missing:
+            print("  missing (first 10):", missing[:10])
+        if unexpected:
+            print("  unexpected (first 10):", unexpected[:10])
 
     model.eval()
 

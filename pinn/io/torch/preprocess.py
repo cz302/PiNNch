@@ -23,25 +23,28 @@ def preprocess_batch_torch(
     atom_types: Sequence[int],
     rc: float,
     nl_builder: nn.Module,
+    make_diff_dist: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Preprocess a *batched* tensor dict for Torch backend.
+    """Preprocess a batched tensor dict for Torch backend.
 
-    Required keys:
-      - coord: (N,3) float tensor
-      - ind_1: (N,1)/(N,2) long tensor, or (N,) long tensor (structure id)
-      - elems: (N,) long tensor (atomic numbers) OR z key can be used by caller
+    This function can optionally *skip* computing edge displacement vectors and
+    distances (diff/dist). That is useful when you want to build the neighbor
+    list (ind_2/shift) on CPU, but compute diff/dist later on GPU from the same
+    coordinate tensor (to preserve gradients for forces).
 
-    Optional:
-      - cell: None, (3,3), or (B,3,3)
-      - ind_2, shift, diff, dist, prop (if present, will not be recomputed)
+    Args:
+        tensors: Sparse-batch dict containing at least coord, ind_1, elems/z.
+        atom_types: Atomic numbers included in the one-hot encoding.
+        rc: Cutoff radius for neighbor list.
+        nl_builder: Neighbor-list builder module.
+        make_diff_dist: If False, only builds prop + (ind_2, shift). If True,
+            also computes (diff, dist) if not already present.
 
     Returns:
-      dict with prop, ind_2, shift, diff, dist present.
+        Updated sparse-batch dict.
     """
     out = dict(tensors)
 
-    # Normalize elems key (some pipelines use z)
     if "elems" not in out and "z" in out:
         out["elems"] = out["z"]
 
@@ -58,19 +61,22 @@ def preprocess_batch_torch(
             rc=rc,
             nl_builder=nl_builder,
         )
-        out.update(nl)  # adds ind_2 and shift
+        out.update(nl)
 
-    if "diff" not in out or "dist" not in out:
-        cell = out.get("cell", None)
-        shift = out.get("shift", None)
-        diff, dist = compute_diff_dist(
-            coord=out["coord"],
-            ind_2=out["ind_2"],
-            cell=cell,
-            shift=shift,
-            ind_1=out["ind_1"],
-        )
-        out["diff"] = diff
-        out["dist"] = dist
+    if make_diff_dist and ("diff" not in out or "dist" not in out):
+        # Only compute diff/dist when coord participates in autograd.
+        # In runtime, coord.requires_grad_(True) is typically set later.
+        if out["coord"].requires_grad:
+            cell = out.get("cell", None)
+            shift = out.get("shift", None)
+            diff, dist = compute_diff_dist(
+                coord=out["coord"],
+                ind_2=out["ind_2"],
+                cell=cell,
+                shift=shift,
+                ind_1=out["ind_1"],
+            )
+            out["diff"] = diff
+            out["dist"] = dist
 
     return out
