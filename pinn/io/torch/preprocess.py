@@ -25,24 +25,6 @@ def preprocess_batch_torch(
     nl_builder: nn.Module,
     make_diff_dist: bool = True,
 ) -> Dict[str, Any]:
-    """Preprocess a batched tensor dict for Torch backend.
-
-    This function can optionally *skip* computing edge displacement vectors and
-    distances (diff/dist). That is useful when you want to build the neighbor
-    list (ind_2/shift) on CPU, but compute diff/dist later on GPU from the same
-    coordinate tensor (to preserve gradients for forces).
-
-    Args:
-        tensors: Sparse-batch dict containing at least coord, ind_1, elems/z.
-        atom_types: Atomic numbers included in the one-hot encoding.
-        rc: Cutoff radius for neighbor list.
-        nl_builder: Neighbor-list builder module.
-        make_diff_dist: If False, only builds prop + (ind_2, shift). If True,
-            also computes (diff, dist) if not already present.
-
-    Returns:
-        Updated sparse-batch dict.
-    """
     out = dict(tensors)
 
     if "elems" not in out and "z" in out:
@@ -61,22 +43,28 @@ def preprocess_batch_torch(
             rc=rc,
             nl_builder=nl_builder,
         )
-        out.update(nl)
+        out.update(nl)  # keep extra keys like shift
 
-    if make_diff_dist and ("diff" not in out or "dist" not in out):
-        # Only compute diff/dist when coord participates in autograd.
-        # In runtime, coord.requires_grad_(True) is typically set later.
-        if out["coord"].requires_grad:
-            cell = out.get("cell", None)
-            shift = out.get("shift", None)
-            diff, dist = compute_diff_dist(
-                coord=out["coord"],
-                ind_2=out["ind_2"],
-                cell=cell,
-                shift=shift,
-                ind_1=out["ind_1"],
-            )
-            out["diff"] = diff
-            out["dist"] = dist
+        # CRITICAL: do NOT keep diff/dist if NL builder provided them
+        # (they may be produced under no_grad / CPU path and won't be autograd-connected).
+        out.pop("diff", None)
+        out.pop("dist", None)
+
+    if make_diff_dist and (("diff" not in out) or ("dist" not in out)):
+        cell = out.get("cell", None)
+        shift = out.get("shift", None)
+
+        if cell is not None and shift is None:
+            raise KeyError("PBC batch has 'cell' but missing 'shift' (expected from NL builder).")
+
+        diff, dist = compute_diff_dist(
+            coord=out["coord"],
+            ind_2=out["ind_2"],
+            cell=cell,
+            shift=shift,
+            ind_1=out["ind_1"],
+        )
+        out["diff"] = diff
+        out["dist"] = dist
 
     return out
