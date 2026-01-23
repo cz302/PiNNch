@@ -592,6 +592,12 @@ def train_and_evaluate(
             if hasattr(model, "eval"):
                 model.eval()
 
+            # --- TF semantics: TRAIN/EVAL happens in scaled label space ---
+            # E_true_scaled = (E_true_raw - E_dress_struct) * e_scale
+            # F_true_scaled = F_true_raw * e_scale
+            model_params = (params.get("model", {}).get("params", {}) or {})
+            e_scale = float(model_params.get("e_scale", 1.0))
+
             e_sq_sum = 0.0
             e_count = 0
             f_sq_sum = 0.0
@@ -618,53 +624,85 @@ def train_and_evaluate(
                     tensors = {k: v for k, v in batch.items() if k not in ("e_data", "f_data")}
                     dev_t = next(model.parameters()).device
                     tensors = move_pinn_batch_to_device(tensors, dev_t)
-                    E_true = batch["e_data"].to(dev_t, non_blocking=True)
-                    F_true = _flatten_forces(batch["f_data"]).to(dev_t, non_blocking=True)
-                    # enforce invariant for force autograd
+
+                    # Raw labels from dataset (Hartree and Hartree/Å for water RuNNer)
+                    E_true_raw = batch["e_data"].to(dev_t, non_blocking=True)
+                    F_true_raw = _flatten_forces(batch["f_data"]).to(dev_t, non_blocking=True)
+
                     coord = tensors["coord"]
-                    if not coord.requires_grad:
-                        coord.requires_grad_(True)
-                    
+                    if (not coord.requires_grad) or (not coord.is_leaf):
+                        coord = coord.detach().clone().requires_grad_(True)
+                        tensors["coord"] = coord
                 else:
                     sb = _make_sparse_batch(batch, device=device)
                     tensors = {k: v for k, v in sb.items() if not k.startswith("_")}
-                    E_true = sb["_E_true"]
-                    F_true = _flatten_forces(sb["_F_true"])
+
+                    E_true_raw = sb["_E_true"]
+                    F_true_raw = _flatten_forces(sb["_F_true"])
+
                     coord = tensors["coord"]
-                    if not coord.requires_grad or not coord.is_leaf:
+                    if (not coord.requires_grad) or (not coord.is_leaf):
                         coord = coord.detach().clone().requires_grad_(True)
                         tensors["coord"] = coord
 
-                E_pred = model(tensors)
-                if E_pred.ndim == 2 and E_pred.shape[1] == 1:
-                    E_pred = E_pred[:, 0]
-                elif E_pred.ndim != 1:
-                    raise ValueError(f"Expected E_pred shape (B,) or (B,1), got {tuple(E_pred.shape)}")
-
-                if cfg.log_e_per_atom:
-                    B = int(E_true.shape[0])
-                    counts = (
-                        torch.bincount(tensors["ind_1"][:, 0], minlength=B)
-                        .to(E_true.dtype)
-                        .clamp_min(1.0)
-                    )
-                    e_err = ((E_pred / counts) / e_unit) - (E_true / counts)
+                # -------- Dress-subtract energy labels (ONLY energy; dressing has zero force) --------
+                if hasattr(model, "dress_struct"):
+                    # returns per-structure dress in RAW label units (Hartree)
+                    dress = model.dress_struct(tensors)
+                    # Safety: ensure shape (B,)
+                    if dress.ndim == 2 and dress.shape[1] == 1:
+                        dress = dress[:, 0]
                 else:
-                    e_err = (E_pred / e_unit) - E_true
+                    dress = 0.0
+
+                # -------- Scale labels into TRAIN/EVAL label space (TF semantics) --------
+                E_true_s = (E_true_raw - dress) * e_scale
+                F_true_s = F_true_raw * e_scale
+
+                # -------- Predict in TRAIN/EVAL label space --------
+                if hasattr(model, "forward_train"):
+                    E_pred_s = model.forward_train(tensors)
+                else:
+                    # Fallback: assume model(tensors) already returns TRAIN/EVAL energy (scaled-space)
+                    E_pred_s = model(tensors)
+
+                if E_pred_s.ndim == 2 and E_pred_s.shape[1] == 1:
+                    E_pred_s = E_pred_s[:, 0]
+                elif E_pred_s.ndim != 1:
+                    raise ValueError(f"Expected E_pred shape (B,) or (B,1), got {tuple(E_pred_s.shape)}")
+
+                # -------- Energy RMSE in scaled label space --------
+                if cfg.log_e_per_atom:
+                    ind_1 = tensors.get("ind_1", None)
+                    if ind_1 is None:
+                        counts = E_true_s.new_tensor([float(tensors["coord"].shape[0])]).clamp_min(1.0)
+                    else:
+                        B = int(E_true_s.shape[0])
+                        counts = (
+                            torch.bincount(ind_1[:, 0], minlength=B)
+                            .to(E_true_s.dtype)
+                            .clamp_min(1.0)
+                        )
+                    e_err = (E_pred_s / counts) - (E_true_s / counts)
+                else:
+                    e_err = E_pred_s - E_true_s
 
                 e_sq_sum += float((e_err ** 2).sum().item())
                 e_count += int(e_err.numel())
 
+                # -------- Force RMSE in scaled label space --------
                 if cfg.use_force:
-                    dE_dR = torch.autograd.grad(E_pred.sum(), coord, create_graph=False)[0]
-                    F_pred = -dE_dR
-                    f_err = (F_pred / e_unit) - F_true
+                    # Forces must be gradients of TRAIN/EVAL energy (scaled-space)
+                    dE_dR = torch.autograd.grad(E_pred_s.sum(), coord, create_graph=False)[0]
+                    F_pred_s = -dE_dR
+                    f_err = F_pred_s - F_true_s
                     f_sq_sum += float((f_err ** 2).sum().item())
                     f_count += int(f_err.numel())
 
             e_rmse = float(np.sqrt(e_sq_sum / max(e_count, 1)))
             f_rmse = float(np.sqrt(f_sq_sum / max(f_count, 1))) if cfg.use_force else 0.0
-            return e_rmse, f_rmse    
+            return e_rmse, f_rmse
+         
 
         # ---- training loop ----
         if hasattr(model, "train"):
@@ -700,45 +738,60 @@ def train_and_evaluate(
                     coord = coord.detach().clone().requires_grad_(True)
                     tensors["coord"] = coord
 
-        # ---- forward energy ----
-            if callable(model):
-                E_pred = model(tensors)            # expected (B,)
+            # ---------------------------
+            # TRAIN in scaled label space (TF semantics)
+            # ---------------------------
+
+            # 0) fetch e_scale (already read above as cfg.e_scale, but keep explicit)
+            e_scale = cfg.e_scale
+
+            # 1) dress-subtract energy labels (dress has no force contribution)
+            if hasattr(model, "dress_struct"):
+                dress = model.dress_struct(tensors)
+                if torch.is_tensor(dress) and dress.ndim == 2 and dress.shape[1] == 1:
+                    dress = dress[:, 0]
             else:
-                raise TypeError("Torch backend expects a callable torch model.")
+                dress = 0.0
 
-            if E_pred.ndim != 1:
-                raise ValueError(f"Expected E_pred shape (B,), got {tuple(E_pred.shape)}")
+            E_true_s = (E_true - dress) * e_scale
+            F_true_s = F_true * e_scale
 
-        #---- forces via autograd (only if needed) ----
+            # 2) forward TRAIN energy (scaled-space)
+            if hasattr(model, "forward_train"):
+                E_pred_s = model.forward_train(tensors)
+            else:
+                # If your model doesn't implement this, you *must* add it (or wrap it)
+                raise TypeError("Torch potential_model must implement forward_train() for TF-parity training.")
+
+            if E_pred_s.ndim == 2 and E_pred_s.shape[1] == 1:
+                E_pred_s = E_pred_s[:, 0]
+            elif E_pred_s.ndim != 1:
+                raise ValueError(f"Expected E_pred_s shape (B,) or (B,1), got {tuple(E_pred_s.shape)}")
+
+            # 3) forces from TRAIN energy
             if cfg.use_force:
                 dE_dR = torch.autograd.grad(
-                E_pred.sum(),
-                coord,
-                create_graph=True,   # force loss needs gradients w.r.t. model params
-                retain_graph=True,   # keep graph for energy backward
+                    E_pred_s.sum(),
+                    coord,
+                    create_graph=True,   # need param grads through forces
+                    retain_graph=True,
                 )[0]
-                F_pred = -dE_dR
+                F_pred_s = -dE_dR
             else:
-                F_pred = None  # type: ignore[assignment]
+                F_pred_s = None  # type: ignore[assignment]
 
-        # ---- loss (same convention as test) ----
-            # ---- energy loss (optionally per-atom normalized) ----
+            # 4) losses in TRAIN space (no /e_unit here)
             if cfg.use_e_per_atom:
-                B = int(E_true.shape[0])
-                counts = torch.bincount(tensors["ind_1"][:, 0], minlength=B).to(E_true.dtype).clamp_min(1.0)
-                E_pred_used = E_pred / counts
-                E_true_used = E_true / counts
+                B = int(E_true_s.shape[0])
+                counts = torch.bincount(tensors["ind_1"][:, 0], minlength=B).to(E_true_s.dtype).clamp_min(1.0)
+                e_err = (E_pred_s / counts) - (E_true_s / counts)
             else:
-                E_pred_used = E_pred
-                E_true_used = E_true
-
-            e_err = (E_pred_used / e_unit) - E_true_used
+                e_err = E_pred_s - E_true_s
             e_loss = (e_err ** 2).mean()
 
-            # ---- force loss (optional) ----
             if cfg.use_force:
-                assert F_pred.shape == F_true.shape, (F_pred.shape, F_true.shape)
-                f_err = (F_pred / e_unit) - F_true
+                assert F_pred_s.shape == F_true_s.shape, (F_pred_s.shape, F_true_s.shape)
+                f_err = F_pred_s - F_true_s
                 f_loss = (f_err ** 2).mean()
             else:
                 f_loss = torch.zeros((), dtype=e_loss.dtype, device=e_loss.device)
@@ -752,24 +805,22 @@ def train_and_evaluate(
                 optim.step()
                 if (step % log_every) == 0:
                     # ---- metric errors: must match eval convention ----
+                    # metrics in TRAIN space (scaled)
                     if cfg.log_e_per_atom:
-                        B = int(E_true.shape[0])
+                        B = int(E_true_s.shape[0])
                         counts = (
                             torch.bincount(tensors["ind_1"][:, 0], minlength=B)
-                            .to(E_true.dtype)
+                            .to(E_true_s.dtype)
                             .clamp_min(1.0)
                         )
-                        # Energy metric is per-atom
-                        e_err_metric = ((E_pred / counts) / e_unit) - (E_true / counts)
+                        e_err_metric = (E_pred_s / counts) - (E_true_s / counts)
                     else:
-                        # Energy metric is per-structure
-                        e_err_metric = (E_pred / e_unit) - E_true
+                        e_err_metric = E_pred_s - E_true_s
 
                     train_e_rmse = torch.sqrt((e_err_metric ** 2).mean()).item()
 
                     if cfg.use_force:
-                        # Force metric is always in force label space (no per-atom normalization)
-                        f_err_metric = (F_pred / e_unit) - F_true
+                        f_err_metric = F_pred_s - F_true_s
                         train_f_rmse = torch.sqrt((f_err_metric ** 2).mean()).item()
                     else:
                         train_f_rmse = 0.0
@@ -841,8 +892,8 @@ def train_and_evaluate(
         writer.close()    
 
     return {
-        "METRICS/E_RMSE": e_scale * e_rmse,
-        "METRICS/F_RMSE": e_scale * f_rmse,
+        "METRICS/E_RMSE": e_rmse,
+        "METRICS/F_RMSE": f_rmse,
     }
 
 

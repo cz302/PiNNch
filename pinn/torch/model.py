@@ -14,50 +14,65 @@ class PiNetPotentialTorch(nn.Module):
     def __init__(self, net, *, e_dress, e_scale, e_unit):
         super().__init__()
         self.net = net
-        self.e_dress = {int(k): float(v) for k, v in e_dress.items()}
+        self.e_dress = {int(k): float(v) for k, v in (e_dress or {}).items()}
         self.e_scale = float(e_scale)
         self.e_unit = float(e_unit)
 
-    def forward(self, tensors: dict) -> torch.Tensor:
-        """Compute per-structure energy in the same units/scale as TF PREDICT.
+    def _sum_to_struct(self, x_atom: torch.Tensor, ind_1: torch.Tensor | None) -> torch.Tensor:
+        if ind_1 is None:
+            return x_atom.sum().view(1)
+        if ind_1.dtype != torch.long:
+            ind_1 = ind_1.long()
+        sid = ind_1[:, 0]
+        B = int(sid.max().item()) + 1 if sid.numel() > 0 else 1
+        out = x_atom.new_zeros((B,))
+        out.index_add_(0, sid, x_atom)
+        return out
 
-        TF reference (pinn/models/potential.py, ModeKeys.PREDICT):
-          pred = pred / e_scale
-          pred += atomic_dress(...)
-          pred *= e_unit
-
-        Returns:
-            1D tensor of shape (n_struct,) in ASE energy units (eV by default).
+    def dress_struct(self, tensors: dict) -> torch.Tensor:
         """
-        e_atom = self.net(tensors)
-        if e_atom.ndim == 2 and e_atom.shape[1] == 1:
-            e_atom = e_atom[:, 0]
+        Per-structure dressing energy in RAW label units (Hartree).
+        Shape: (B,) or (1,)
+        """
+        ind_1 = tensors.get("ind_1", None)
+        like = tensors["coord"]  # just for dtype/device
+        if not self.e_dress:
+            # return zeros with correct shape/device/dtype
+            if ind_1 is None:
+                return like.new_zeros((1,), dtype=like.dtype)
+            if ind_1.dtype != torch.long:
+                ind_1 = ind_1.long()
+            sid = ind_1[:, 0]
+            B = int(sid.max().item()) + 1 if sid.numel() > 0 else 1
+            return like.new_zeros((B,), dtype=like.dtype)
 
-        ind_1 = tensors["ind_1"][:, 0]
-        n_struct = int(ind_1.max()) + 1 if ind_1.numel() else 0
+        elems = tensors["elems"]
+        dress_atoms = like.new_zeros((elems.shape[0],), dtype=like.dtype)
+        for Z, val in self.e_dress.items():
+            mask = (elems == int(Z))
+            if mask.any():
+                dress_atoms[mask] = float(val)
 
-        e_struct = torch.zeros(n_struct, device=e_atom.device, dtype=e_atom.dtype)
-        e_struct.index_add_(0, ind_1, e_atom)
+        return self._sum_to_struct(dress_atoms, ind_1)
 
-        # --- Match TF predict post-processing ---
-        # 1) undo training scaling
-        if self.e_scale != 1.0:
-            e_struct = e_struct / self.e_scale
+    def forward_train(self, tensors: dict) -> torch.Tensor:
+        """
+        TRAIN/EVAL forward: returns E_pred_scaled in *scaled label space*.
+        (No unit conversion, no dressing, no undo scale)
+        """
+        ann_out = self.net(tensors)
+        e_atom = ann_out["energy"] if isinstance(ann_out, dict) else ann_out
+        return self._sum_to_struct(e_atom, tensors.get("ind_1", None))
 
-        # 2) energy dressing in label units (same place TF adds it)
-        if self.e_dress:
-            elems = tensors["elems"]
-            dress_atom = torch.zeros_like(e_atom)
-            for z, val in self.e_dress.items():
-                dress_atom = dress_atom + (elems == z).to(e_atom.dtype) * val
-            dress_struct = torch.zeros_like(e_struct).index_add_(0, ind_1, dress_atom)
-            e_struct = e_struct + dress_struct
-
-        # 3) unit conversion
-        if self.e_unit != 1.0:
-            e_struct = e_struct * self.e_unit
-
-        return e_struct
+    def forward(self, tensors: dict) -> torch.Tensor:
+        """
+        PREDICT forward: returns E_out in eV (TF-PREDICT semantics).
+        """
+        E_scaled = self.forward_train(tensors)
+        dress = self.dress_struct(tensors)          # RAW 
+        E_raw = E_scaled / self.e_scale + dress     # RAW
+        E_out = E_raw * self.e_unit                 # eV
+        return E_out
 
 
 def _materialize_lazy(model: torch.nn.Module, *, atom_types) -> None:
@@ -82,7 +97,7 @@ def _materialize_lazy(model: torch.nn.Module, *, atom_types) -> None:
 
     model.eval()
     with torch.no_grad():
-        _ = model(tensors)
+        _ = model.forward_train(tensors)
 
 def get_model(params: dict, **kwargs) -> nn.Module:
     """Torch backend model factory.

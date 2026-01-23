@@ -9,7 +9,7 @@ recompute geometry features).
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Any
+from typing import Dict, Sequence, Any, Optional
 
 import torch
 import torch.nn as nn
@@ -25,6 +25,19 @@ def preprocess_batch_torch(
     nl_builder: nn.Module,
     make_diff_dist: bool = True,
 ) -> Dict[str, Any]:
+    """
+    Preprocess a single-structure Torch batch.
+
+    Adds/ensures:
+      - elems (alias of z if needed)
+      - prop (one-hot of elems)
+      - ind_2 (+ shift for PBC) via build_nl_celllist if missing
+      - diff/dist computed by compute_diff_dist() (single source of truth)
+
+    PBC convention:
+      - If shift is present, diff = (r_j - r_i) + (shift @ cell)  (multi-image safe)
+      - If shift is absent, compute_diff_dist infers a compatible shift by rounding.
+    """
     out = dict(tensors)
 
     if "elems" not in out and "z" in out:
@@ -43,25 +56,20 @@ def preprocess_batch_torch(
             rc=rc,
             nl_builder=nl_builder,
         )
-        out.update(nl)  # keep extra keys like shift
+        out.update(nl)  # keeps ind_2 and shift
 
-        # CRITICAL: do NOT keep diff/dist if NL builder provided them
-        # (they may be produced under no_grad / CPU path and won't be autograd-connected).
+        # IMPORTANT:
+        # If NL builder gave diff/dist, drop them because builder runs under no_grad
+        # and we need autograd-connected diff/dist for forces/stress.
         out.pop("diff", None)
         out.pop("dist", None)
 
     if make_diff_dist and (("diff" not in out) or ("dist" not in out)):
-        cell = out.get("cell", None)
-        shift = out.get("shift", None)
-
-        if cell is not None and shift is None:
-            raise KeyError("PBC batch has 'cell' but missing 'shift' (expected from NL builder).")
-
         diff, dist = compute_diff_dist(
             coord=out["coord"],
             ind_2=out["ind_2"],
-            cell=cell,
-            shift=shift,
+            cell=out.get("cell", None),
+            shift=out.get("shift", None),  # <-- critical: use shift if provided
             ind_1=out["ind_1"],
         )
         out["diff"] = diff

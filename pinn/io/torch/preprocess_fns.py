@@ -215,8 +215,6 @@ def build_nl_celllist(
         out["dist"] = torch.cat(dist_list, dim=0)
     return out
 
-
-
 def compute_diff_dist(
     *,
     coord: torch.Tensor,
@@ -226,45 +224,81 @@ def compute_diff_dist(
     ind_1: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute diff and dist for directed edges.
+    Compute diff/dist for directed edges.
+
+    Geometry contract (single source of truth):
+
+      - Non-PBC:      diff = r_j - r_i
+      - PBC (general): diff = (r_j - r_i) + (shift @ cell)
+
+        where `cell` is (3,3) with lattice vectors in rows (ASE convention),
+        and `shift` is an integer (E,3) giving which periodic image of j is used.
+
+    Key point:
+      - If `shift` is provided, we MUST use it (multi-image / extended regime).
+      - If `shift` is missing, we infer a compatible `shift` by MIC rounding
+        (robust for unwrapped coordinates), then use the same formula above.
 
     Args:
-        coord: (N,3)
-        ind_2: (E,2) long
+        coord: (N,3) Cartesian coordinates
+        ind_2: (E,2) directed edges (i,j)
         cell: None, (3,3), or (B,3,3)
-        shift: None or (E,3) long integer image shifts
-        ind_1: (N,1)/(N,2) or (N,) used for structure id mapping if cell is per-structure
+        shift: (E,3) integer image shifts (may be None)
+        ind_1: (N,1)/(N,2) or (N,) mapping atoms -> structure id when cell is per-structure
 
     Returns:
-        diff: (E,3)
-        dist: (E,)
+        diff: (E,3) displacement vectors
+        dist: (E,) Euclidean norms
     """
     i = ind_2[:, 0]
     j = ind_2[:, 1]
 
-    # No PBC info
-    if cell is None or shift is None:
+    # ---------------- Non-PBC ----------------
+    if cell is None:
         diff = coord[j] - coord[i]
         dist = torch.linalg.norm(diff, dim=1)
         return diff, dist
 
-    # PBC global cell
+    # Raw Cartesian displacement
+    d = coord[j] - coord[i]  # (E,3)
+
+    # ---------------- PBC: global cell (3,3) ----------------
     if cell.ndim == 2:
-        H = cell.to(device=coord.device, dtype=coord.dtype)     # (3,3)
-        t = shift.to(coord.dtype) @ H                           # (E,3)
-        diff = (coord[j] + t) - coord[i]
+        H = cell.to(device=coord.device, dtype=coord.dtype)
+
+        if shift is None:
+            invH = torch.linalg.inv(H)
+            # n = round(d @ invH) are the integer crossings
+            n = torch.round(d @ invH).to(torch.long)   # (E,3)
+            shift_use = (-n)                           # (E,3) long, can be large
+        else:
+            shift_use = shift.to(device=coord.device, dtype=torch.long)
+
+        diff = d + (shift_use.to(coord.dtype) @ H)     # (E,3)
         dist = torch.linalg.norm(diff, dim=1)
         return diff, dist
 
-    # PBC per-structure cell
+    # ---------------- PBC: per-structure cell (B,3,3) ----------------
     if cell.ndim == 3:
         if ind_1.dtype != torch.long:
             ind_1 = ind_1.long()
-        batch = ind_1[:, 0] if ind_1.ndim == 2 else ind_1       # (N,)
-        sid = batch[i]                                          # (E,)
-        H_pair = cell[sid].to(device=coord.device, dtype=coord.dtype)  # (E,3,3)
-        t = torch.einsum("ei,eij->ej", shift.to(coord.dtype), H_pair)  # (E,3)
-        diff = (coord[j] + t) - coord[i]
+        batch = ind_1[:, 0] if ind_1.ndim == 2 else ind_1  # (N,)
+        sid = batch[i]                                     # (E,)
+
+        H_all = cell.to(device=coord.device, dtype=coord.dtype)  # (B,3,3)
+        H_pair = H_all[sid]                                      # (E,3,3)
+
+        if shift is None:
+            inv_all = torch.linalg.inv(H_all)                    # (B,3,3)
+            inv_pair = inv_all[sid]                              # (E,3,3)
+            # n = round(d @ inv_pair) (batched)
+            n = torch.round(torch.einsum("ei,eij->ej", d, inv_pair)).to(torch.long)  # (E,3)
+            shift_use = (-n)
+        else:
+            shift_use = shift.to(device=coord.device, dtype=torch.long)
+
+        # diff = d + shift @ H_pair  (batched)
+        diff = d + torch.einsum("ei,eij->ej", shift_use.to(coord.dtype), H_pair)     # (E,3)
         dist = torch.linalg.norm(diff, dim=1)
         return diff, dist
 

@@ -169,9 +169,10 @@ class TorchPiNNCalc(Calculator):
         
 
         # Model already returns total energy in ASE units
-        E = self.model(tensors)
+        E_raw = self.model(tensors)          # model-native energy (label space)
+        E = E_raw
         if self.to_eV != 1.0:
-            E = E * self.to_eV
+            E = E_raw * self.to_eV           # physical energy for ASE
 
         if E.ndim == 0:
             E = E.view(1)
@@ -183,21 +184,21 @@ class TorchPiNNCalc(Calculator):
         # --- Forces from autograd on coordinates ---
         if pbc:
             (dE_dfrac,) = torch.autograd.grad(
-                E.sum(), frac,
+                E_raw.sum(), frac,
                 create_graph=False,
                 retain_graph=need_stress,
             )
             inv_cell_T = torch.inverse(cell).transpose(0, 1)
             dE_dR = dE_dfrac @ inv_cell_T
-            F = -dE_dR
+            F = -dE_dR * self.to_eV
             assert torch.isfinite(dE_dfrac).all()
         else:
             (dE_dR,) = torch.autograd.grad(
-                E.sum(), coord,
+                E_raw.sum(), coord,
                 create_graph=False,
                 retain_graph=need_stress,
             )
-            F = -dE_dR
+            F = -dE_dR * self.to_eV
             assert torch.isfinite(dE_dR).all()
 
         self.results["energy"] = float(E.item())
@@ -228,11 +229,13 @@ class TorchPiNNCalc(Calculator):
                     raise RuntimeError("dist/diff stress requires tensors['diff'] and tensors['ind_2'].")
 
                 if stress_mode == "diff":
-                    dE_ddiff = torch.autograd.grad(E.sum(), diff, create_graph=False, retain_graph=False)[0]  # (n_pairs,3)
+                    dE_ddiff = torch.autograd.grad(E_raw.sum(), diff, create_graph=False, retain_graph=False)[0]  # (n_pairs,3)
+                    dE_ddiff = dE_ddiff * self.to_eV
                 else:
                     if dist is None:
                         raise RuntimeError("dist stress requires tensors['dist'].")
-                    dE_ddist = torch.autograd.grad(E.sum(), dist, create_graph=False, retain_graph=False)[0]  # (n_pairs,)
+                    dE_ddist = torch.autograd.grad(E_raw.sum(), dist, create_graph=False, retain_graph=False)[0]  # (n_pairs,)
+                    dE_ddist = dE_ddist * self.to_eV
                     inv_r = dist.clamp_min(1e-12).reciprocal()
                     dE_ddiff = dE_ddist.unsqueeze(-1) * diff * inv_r.unsqueeze(-1)  # chain rule
 
@@ -246,7 +249,8 @@ class TorchPiNNCalc(Calculator):
             if stress_mode == "cell":
                 # Full thermodynamic stress at fixed fractional coords:
                 # sigma = -(dE/dcell @ cell^T) / V
-                dE_dcell = torch.autograd.grad(E.sum(), cell, create_graph=False, retain_graph=False)[0]  # (3,3)
+                dE_dcell = torch.autograd.grad(E_raw.sum(), cell, create_graph=False, retain_graph=False)[0]  # (3,3)
+                dE_dcell = dE_dcell * self.to_eV
                 sigma = -(dE_dcell @ cell.transpose(0, 1)) / V
                 self.results["stress"] = to_ase_stress6(sigma)
                 return
