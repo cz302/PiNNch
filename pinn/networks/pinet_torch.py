@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional, Sequence, Union
-from pinn.io.torch.preprocess_fns import build_nl_celllist, compute_diff_dist, atomic_onehot
+from pinn.io.torch.preprocess_fns import build_nl_celllist, compute_diff_dist
 
 import torch
 import torch.nn as nn
@@ -707,7 +707,25 @@ class NLRouter(nn.Module):
                     return build_nl_celllist(ind_1=ind_1, coord=coord, cell=cell, rc=rc_eff, nl_builder=self.nl_free)
                 L = torch.abs(torch.diagonal(H, dim1=1, dim2=2))  # (B,3)
                 Lmin = float(torch.min(L).item())
-                mic_ok = (rc_eff <= 0.5 * Lmin)
+                # ---- PBC handling ----
+                invH = torch.linalg.inv(cell if cell.ndim == 2 else cell[0])
+                n_repeat = torch.ceil(rc_eff * torch.linalg.norm(invH, dim=1)).to(torch.long)
+
+                mic_ok = bool((n_repeat <= 1).all())
+
+                if mic_ok:
+                    # PURE MIC regime: no image enumeration
+                    return self.nl_pbc(coord, ind_1=ind_1, cell=cell)
+                else:
+                    # EXTENDED-IMAGE regime: MUST enumerate images
+                    return build_nl_celllist(
+                        ind_1=ind_1,
+                        coord=coord,
+                        cell=cell,
+                        rc=rc_eff,
+                        nl_builder=self.nl_free,
+                    )
+
             else:
                 # unexpected shape: fallback to robust path
                 return build_nl_celllist(ind_1=ind_1, coord=coord, cell=cell, rc=rc_eff, nl_builder=self.nl_free)
@@ -913,9 +931,6 @@ class PreprocessLayerTorch(nn.Module):
             cell = out.get("cell", None)
             shift = out.get("shift", None)
 
-            if cell is not None and shift is None:
-                raise KeyError("PBC batch has 'cell' but missing 'shift' (expected from NL builder).")
-
             diff, dist = compute_diff_dist(
                 coord=out["coord"],
                 ind_2=out["ind_2"],
@@ -927,44 +942,7 @@ class PreprocessLayerTorch(nn.Module):
             out["dist"] = dist
 
         return out
-    def _compute_diff_dist(
-        self,
-        coord: torch.Tensor,
-        ind_2: torch.Tensor,
-        cell: Optional[torch.Tensor],
-        shift: Optional[torch.Tensor],
-        ind_1: torch.Tensor,
-    ):
-        i = ind_2[:, 0]
-        j = ind_2[:, 1]
-
-        # No PBC info
-        if cell is None or shift is None:
-            diff = coord[j] - coord[i]
-            dist = torch.linalg.norm(diff, dim=1)
-            return diff, dist
-
-        # PBC: use explicit image shifts; DO NOT wrap coords
-        if cell.ndim == 2:
-            H = cell.to(device=coord.device, dtype=coord.dtype)     # (3,3)
-            t = shift.to(coord.dtype) @ H                           # (M,3)
-            diff = (coord[j] + t) - coord[i]
-            dist = torch.linalg.norm(diff, dim=1)
-            return diff, dist
-
-        if cell.ndim == 3:
-            if ind_1.dtype != torch.long:
-                ind_1 = ind_1.long()
-            batch = ind_1[:, 0] if ind_1.ndim == 2 else ind_1       # (N,)
-
-            sid = batch[i]                                          # (M,)
-            H_pair = cell[sid].to(device=coord.device, dtype=coord.dtype)  # (M,3,3)
-            t = torch.einsum("mi,mij->mj", shift.to(coord.dtype), H_pair)  # (M,3)
-            diff = (coord[j] + t) - coord[i]
-            dist = torch.linalg.norm(diff, dim=1)
-            return diff, dist
-
-        raise ValueError(f"Unexpected cell shape {tuple(cell.shape)}")
+    
 
 class PiNetTorch(nn.Module):
     """
@@ -1056,27 +1034,21 @@ class CellListNLPyTorch(nn.Module):
     """
     Linked-cell neighbor list builder (directed i->j pairs) with optional PBC.
 
-    This is a performance-oriented replacement for the brute-force cdist neighbor
-    list. It bins atoms into a grid of cells with linear size ~= rc, then checks
-    only atoms in neighboring cells (27 neighbors in 3D).
+    TF-faithful logic (wrap + replicate + linked-cell), BUT returns `shift`
+    that is consistent with RAW (possibly unwrapped) input coordinates, so that:
 
-    PBC rule (matches PiNN style):
-        - If 'cell' is provided, we compute displacements using MIC in fractional
-          coordinates and map back to Cartesian using the cell matrix convention:
-              frac = coord @ inv(cell)
-              coord = frac @ cell
-        - If 'cell' is not provided, we treat the system as non-periodic.
+        diff = (r_j - r_i) + (shift @ cell)
 
-    Notes:
-        - Intended to be correct and much faster than O(n^2) for typical systems.
-        - For very small systems, brute-force is fine; this is for scaling.
+    matches the displacement used to accept the neighbor.
+
+    This fixes the "correct edge count but huge distances" failure when the dataset
+    contains coordinates outside the primary cell.
     """
 
     def __init__(self, rc: float) -> None:
         super().__init__()
         self.rc = float(rc)
 
-        # 27 neighbor cell offsets in 3D
         offs = []
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
@@ -1084,23 +1056,23 @@ class CellListNLPyTorch(nn.Module):
                     offs.append((dx, dy, dz))
         self.register_buffer("neighbor_offsets", torch.tensor(offs, dtype=torch.long))
 
+    @staticmethod
+    def _displace_matrix(max_repeat: torch.Tensor) -> torch.Tensor:
+        mx, my, mz = int(max_repeat[0].item()), int(max_repeat[1].item()), int(max_repeat[2].item())
+        sx = torch.arange(-mx, mx + 1, dtype=torch.long, device=max_repeat.device)
+        sy = torch.arange(-my, my + 1, dtype=torch.long, device=max_repeat.device)
+        sz = torch.arange(-mz, mz + 1, dtype=torch.long, device=max_repeat.device)
+        Sx, Sy, Sz = torch.meshgrid(sx, sy, sz, indexing="ij")
+        disp = torch.stack([Sx.reshape(-1), Sy.reshape(-1), Sz.reshape(-1)], dim=1)  # (S,3)
+        keep = (disp != 0).any(dim=1)
+        return disp[keep]
+
     @torch.no_grad()
     def forward(self, coord: torch.Tensor, *, cell: Optional[torch.Tensor] = None) -> dict:
-        """
-        Build neighbor list for a single structure.
-
-        Args:
-            coord: (n,3) Cartesian coordinates.
-            cell:  Optional (3,3) cell matrix. If provided, PBC/MIC is used.
-
-        Returns:
-            dict with:
-              - ind_2: (n_pairs,2) long tensor of directed pairs (i,j)
-        """
         device = coord.device
         dtype = coord.dtype
         rc = self.rc
-        rc2 = rc * rc 
+        rc2 = rc * rc
 
         n = int(coord.shape[0])
         if n == 0:
@@ -1109,107 +1081,84 @@ class CellListNLPyTorch(nn.Module):
                 "shift": torch.zeros((0, 3), dtype=torch.long, device=device),
             }
 
+        # -------------------- Non-PBC --------------------
         if cell is None:
-            # Non-PBC: build a bounding box in Cartesian
-            cmin = coord.min(dim=0).values
-            cmax = coord.max(dim=0).values
+            pos_aug = coord
+            orig_aug = torch.arange(n, device=device, dtype=torch.long)
+            shift_rep_aug = torch.zeros((n, 3), device=device, dtype=torch.long)  # always 0
+            wrap_n = None  # not used
+            # binning in Cartesian
+            cmin = pos_aug.min(dim=0).values
+            cmax = pos_aug.max(dim=0).values
             span = (cmax - cmin).clamp_min(1e-6)
-            # cell size = rc
             ncell = torch.floor(span / rc).to(torch.long).clamp_min(1)
-            # assign cell indices
-            rel = (coord - cmin) / rc
+            rel = (pos_aug - cmin) / rc
             ci = torch.floor(rel).to(torch.long)
             ci = torch.minimum(ci, ncell - 1)
-            # linearize
             mult = torch.tensor([ncell[1] * ncell[2], ncell[2], 1], device=device, dtype=torch.long)
             lin = (ci * mult).sum(dim=1)
-            pbc = False
-            H = None
-            H_inv = None
+
+        # -------------------- PBC: wrap + replicate + linked-cell --------------------
         else:
-            # PBC in fractional space: define grid in fractional coords
-            H = cell.to(device=device, dtype=dtype)
-            H_inv = torch.linalg.inv(H)
-            frac = coord @ H_inv  # (n,3)
-            frac = frac - torch.floor(frac)  # wrap into [0,1)
-            # grid resolution: cells per axis ~ |a|/rc etc. in Cartesian is messy for triclinic;
-            # in fractional space, we just choose ncell from effective lengths.
-            # Use norms of cell vectors as approximate lengths.
-            lengths = torch.linalg.norm(H, dim=1).clamp_min(1e-6)  # (3,)
-            ncell = torch.floor(lengths / rc).to(torch.long).clamp_min(1)
-            # mic_ok: MIC is valid only if cutoff sphere fits inside the cell;
-            # otherwise we must enumerate periodic images (ASE-style).
-            minL = float(lengths.min().item())
-            mic_ok = (rc <= 0.5 * minL)
+            H = cell.to(device=device, dtype=dtype)  # (3,3) rows
+            invH = torch.linalg.inv(H)
 
-            shifts = None
-            T = None
+            # --- compute integer wrap offsets per atom from RAW coords ---
+            frac_raw = coord @ invH                         # (n,3)
+            wrap_n = torch.floor(frac_raw).to(torch.long)   # (n,3)  << key piece
 
-            # Only build extended-image shifts if MIC is NOT valid
-            if not mic_ok:
-                kx = int(np.ceil(rc / float(lengths[0].item())))
-                ky = int(np.ceil(rc / float(lengths[1].item())))
-                kz = int(np.ceil(rc / float(lengths[2].item())))
+            # wrapped coords in Cartesian: coord_wrapped = coord - (wrap_n @ H)
+            coord_wrapped = coord - (wrap_n.to(dtype) @ H)   # (n,3)
 
-                sx = torch.arange(-kx, kx + 1, device=device, dtype=torch.long)
-                sy = torch.arange(-ky, ky + 1, device=device, dtype=torch.long)
-                sz = torch.arange(-kz, kz + 1, device=device, dtype=torch.long)
-                Sx, Sy, Sz = torch.meshgrid(sx, sy, sz, indexing="ij")
-                shifts = torch.stack([Sx.reshape(-1), Sy.reshape(-1), Sz.reshape(-1)], dim=1)  # (S,3)
-                T = shifts.to(dtype) @ H  # (S,3) translation vectors in Cartesian
+            # TF repeat rule: n_repeat = ceil(rc * norm(invH, axis=1))
+            n_repeat = torch.ceil(rc * torch.linalg.norm(invH, dim=1)).to(torch.long)  # (3,)
+            disp_mat = self._displace_matrix(n_repeat)  # (S,3)
 
-            rel = frac * ncell.to(dtype=dtype)
+            # in single-structure case this mask is always True, but keep it explicit
+            repeat_mask = (torch.abs(disp_mat) <= n_repeat[None, :]).all(dim=1)
+            disp_use = disp_mat[repeat_mask]  # (Suse,3)
+
+            S = int(disp_use.shape[0])
+            if S == 0:
+                pos_aug = coord_wrapped
+                orig_aug = torch.arange(n, device=device, dtype=torch.long)
+                shift_rep_aug = torch.zeros((n, 3), device=device, dtype=torch.long)
+            else:
+                rep_a = torch.arange(n, device=device, dtype=torch.long).repeat_interleave(S)  # (n*S,)
+                rep_r = torch.arange(S, device=device, dtype=torch.long).repeat(n)             # (n*S,)
+                rep_shift = disp_use[rep_r]                                                   # (n*S,3)
+
+                rep_pos = coord_wrapped[rep_a] + (rep_shift.to(dtype) @ H)  # (n*S,3)
+
+                pos_aug = torch.cat([coord_wrapped, rep_pos], dim=0)
+                orig_aug = torch.cat([torch.arange(n, device=device, dtype=torch.long), rep_a], dim=0)
+                shift_rep_aug = torch.cat(
+                    [torch.zeros((n, 3), device=device, dtype=torch.long), rep_shift],
+                    dim=0
+                )
+
+            # binning uses translated coords (TF shifts by min)
+            pos0 = pos_aug - pos_aug.min(dim=0).values
+            cmin = pos0.min(dim=0).values
+            cmax = pos0.max(dim=0).values
+            span = (cmax - cmin).clamp_min(1e-6)
+            ncell = torch.floor(span / rc).to(torch.long).clamp_min(1)
+            rel = (pos0 - cmin) / rc
             ci = torch.floor(rel).to(torch.long)
             ci = torch.minimum(ci, ncell - 1)
             mult = torch.tensor([ncell[1] * ncell[2], ncell[2], 1], device=device, dtype=torch.long)
             lin = (ci * mult).sum(dim=1)
-            pbc = True
-            # --- fast-path: degenerate grid (all atoms in one cell) ---
-            # Only meaningful when we are in the extended-image fallback (T/shifts exist).
-            if (not mic_ok) and int(ncell.min().item()) == 1 and int(ncell.max().item()) == 1:
-                ii, jj = torch.meshgrid(
-                    torch.arange(n, device=device, dtype=torch.long),
-                    torch.arange(n, device=device, dtype=torch.long),
-                    indexing="ij",
-                )
-                ii = ii.reshape(-1)
-                jj = jj.reshape(-1)
 
-                di = coord[ii]   # (P,3)
-                dj0 = coord[jj]  # (P,3)
-
-                d = (dj0.unsqueeze(0) + T.unsqueeze(1)) - di.unsqueeze(0)  # (S,P,3)
-                dist2 = (d * d).sum(dim=-1)                                # (S,P)
-                keep = (dist2 > 0.0) & (dist2 < rc2)
-
-                if keep.any():
-                    s_idx, p_idx = keep.nonzero(as_tuple=True)
-                    pairs = torch.stack([ii[p_idx], jj[p_idx]], dim=1)     # (K,2)
-                    sh = shifts[s_idx]                                     # (K,3)
-                    rows = torch.cat([pairs, sh], dim=1)                   # (K,5)
-                    rows_uniq = torch.unique(rows, dim=0)
-                    return {"ind_2": rows_uniq[:, :2], "shift": rows_uniq[:, 2:]}
-                else:
-                    return {
-                        "ind_2": torch.zeros((0, 2), dtype=torch.long, device=device),
-                        "shift": torch.zeros((0, 3), dtype=torch.long, device=device),
-                    }
-            
-
-        # Build buckets: map linear cell id -> list of atom indices
-        # We do this by sorting atoms by cell id, then slicing contiguous runs.
+        # -------------------- buckets --------------------
         order = torch.argsort(lin)
         lin_sorted = lin[order]
 
-        # Find segment boundaries
         is_new = torch.ones_like(lin_sorted, dtype=torch.bool)
         is_new[1:] = lin_sorted[1:] != lin_sorted[:-1]
         starts = torch.nonzero(is_new, as_tuple=False).squeeze(1)
-        ends = torch.cat([starts[1:], torch.tensor([n], device=device, dtype=starts.dtype)])
+        ends = torch.cat([starts[1:], torch.tensor([lin_sorted.numel()], device=device, dtype=starts.dtype)])
+        unique_cells = lin_sorted[starts]
 
-        unique_cells = lin_sorted[starts]  # cell ids present
-
-        # Helper: convert linear id back to 3D cell index
         def unravel(lid: torch.Tensor) -> torch.Tensor:
             cx = lid // mult[0]
             rem = lid - cx * mult[0]
@@ -1217,107 +1166,75 @@ class CellListNLPyTorch(nn.Module):
             cz = rem - cy * mult[1]
             return torch.stack([cx, cy, cz], dim=-1)
 
-        cell_xyz = unravel(unique_cells)  # (n_occ,3)
+        cell_xyz = unravel(unique_cells)
 
-        # Build a dict-like lookup from cell xyz -> segment [start,end)
-        # We'll use a hash: key = cx*(ny*nz)+cy*nz+cz == linear id, so unique_cells already is key.
-        # We need to lookup neighbor cell ids quickly: we can binary-search in unique_cells.
-        # Since unique_cells is sorted, torch.searchsorted works.
-        ind2_list = []
-        shift_list = []
+        # collect i only from originals (TF to_collect)
+        is_orig = torch.zeros((pos_aug.shape[0],), dtype=torch.bool, device=device)
+        is_orig[:n] = True
 
-        # Iterate occupied cells
+        ind2_list: List[torch.Tensor] = []
+        shift_list: List[torch.Tensor] = []
+
         for k in range(unique_cells.numel()):
-            lid = unique_cells[k]
             a0, a1 = int(starts[k].item()), int(ends[k].item())
-            atoms_i = order[a0:a1]  # atoms in this cell
+            atoms_in_cell = order[a0:a1]
+            if atoms_in_cell.numel() == 0:
+                continue
 
-            cxyz = cell_xyz[k]  # (3,)
-            # 27 neighbor cells
-            neigh_xyz = cxyz[None, :] + self.neighbor_offsets  # (27,3)
-            if pbc:
-                neigh_xyz = neigh_xyz % ncell[None, :]  # wrap cell indices
-            else:
-                # clamp for non-pbc: drop out-of-range neighbor cells
-                inb = (neigh_xyz >= 0).all(dim=1) & (neigh_xyz < ncell[None, :]).all(dim=1)
-                neigh_xyz = neigh_xyz[inb]
+            atoms_i = atoms_in_cell[is_orig[atoms_in_cell]]  # i are originals only
+            if atoms_i.numel() == 0:
+                continue
 
-            # Convert neighbor xyz -> linear ids
+            cxyz = cell_xyz[k]
+            neigh_xyz = cxyz[None, :] + self.neighbor_offsets
+            inb = (neigh_xyz >= 0).all(dim=1) & (neigh_xyz < ncell[None, :]).all(dim=1)
+            neigh_xyz = neigh_xyz[inb]
+            if neigh_xyz.numel() == 0:
+                continue
+
             neigh_lid = (neigh_xyz * mult[None, :]).sum(dim=1)
-            # Find which neighbor cells are occupied
-            pos = torch.searchsorted(unique_cells, neigh_lid)
-
-            in_range = pos < unique_cells.numel()
-            pos_in = pos[in_range]
+            pos_idx = torch.searchsorted(unique_cells, neigh_lid)
+            in_range = pos_idx < unique_cells.numel()
+            pos_in = pos_idx[in_range]
             neigh_in = neigh_lid[in_range]
-
             ok = unique_cells[pos_in] == neigh_in
-            pos = pos_in[ok]
+            pos_idx = pos_in[ok]
 
-            for kk in pos.tolist():
+            for kk in pos_idx.tolist():
                 b0, b1 = int(starts[kk].item()), int(ends[kk].item())
                 atoms_j = order[b0:b1]
-                if atoms_i.numel() == 0 or atoms_j.numel() == 0:
+                if atoms_j.numel() == 0:
                     continue
 
-                # Generate all cross pairs between atoms_i and atoms_j
                 ii = atoms_i.repeat_interleave(atoms_j.numel())
                 jj = atoms_j.repeat(atoms_i.numel())
 
-                # Remove self-pairs only in non-PBC case.
-                # In PBC, we must allow i==j because self-images (shift != 0) are real neighbors
-                # and ASE neighbor_list includes them.
-                if not pbc:
-                    mask = ii != jj
-                    if mask.any():
-                        ii = ii[mask]
-                        jj = jj[mask]
-                    else:
-                        continue  
+                d = pos_aug[jj] - pos_aug[ii]
+                dist2 = (d * d).sum(dim=-1)
+                keep = (dist2 > 0.0) & (dist2 < rc2)
+                if not keep.any():
+                    continue
 
-                # Build candidate pairs (ii, jj). Filter by distance without building graph.
-                # It's fine to compute distances here under no_grad just for pruning pairs.
-                if not pbc:
-                    d = coord[jj] - coord[ii]
-                    dist2 = (d * d).sum(dim=-1)
-                    keep = (dist2 > 0.0) & (dist2 < rc2)
-                    if keep.any():
-                        ind2_list.append(torch.stack([ii[keep], jj[keep]], dim=1))
-                        shift_list.append(torch.zeros((int(keep.sum().item()), 3), dtype=torch.long, device=device))
+                ii = ii[keep]
+                jj = jj[keep]
+
+                i_orig = ii                           # originals are 0..n-1
+                j_orig = orig_aug[jj]                 # map replica -> original
+                shift_rep = shift_rep_aug[jj]         # replica shift in wrapped-space convention
+
+                if cell is None:
+                    shift_out = torch.zeros_like(shift_rep)
                 else:
-                    if mic_ok:
-                        # --- FAST PATH: MIC per pair (no image enumeration) ---
-                        di_frac = frac[ii]  # (P,3)
-                        dj_frac = frac[jj]  # (P,3)
+                    # >>> CRITICAL FIX: convert shift to RAW-coordinate convention <<<
+                    # shift_out = shift_rep - wrap_n[j] + wrap_n[i]
+                    # where wrap_n are the floor(frac_raw) offsets of ORIGINAL atoms.
+                    assert wrap_n is not None
+                    ni = wrap_n[i_orig]               # (K,3)
+                    nj = wrap_n[j_orig]               # (K,3)
+                    shift_out = shift_rep - nj + ni
 
-                        dfrac = dj_frac - di_frac                    # (P,3)
-                        shift = -torch.round(dfrac).to(torch.long)    # (P,3) integer MIC shift
-                        dfrac = dfrac + shift.to(dfrac.dtype)         # wrap into [-0.5, 0.5] (MIC)
-
-                        d = dfrac @ H                                 # (P,3) Cartesian displacement
-                        dist2 = (d * d).sum(dim=-1)                   # (P,)
-                        keep = (dist2 > 0.0) & (dist2 < rc2)
-
-                        if keep.any():
-                            ind2_list.append(torch.stack([ii[keep], jj[keep]], dim=1))
-                            shift_list.append(shift[keep])
-
-                    else:
-                        # --- FALLBACK: extended images (physics when rc is large vs cell) ---
-                        di = coord[ii]    # (P,3)
-                        dj0 = coord[jj]   # (P,3)
-
-                        d = (dj0.unsqueeze(0) + T.unsqueeze(1)) - di.unsqueeze(0)  # (S,P,3)
-                        dist2 = (d * d).sum(dim=-1)                                # (S,P)
-                        keep = (dist2 > 0.0) & (dist2 < rc2)
-
-                        if keep.any():
-                            s_idx, p_idx = keep.nonzero(as_tuple=True)
-                            pairs = torch.stack([ii[p_idx], jj[p_idx]], dim=1)     # (K,2)
-                            sh = shifts[s_idx]                                     # (K,3)
-                            ind2_list.append(pairs)
-                            shift_list.append(sh)
-
+                ind2_list.append(torch.stack([i_orig, j_orig], dim=1))
+                shift_list.append(shift_out)
 
         if len(ind2_list) == 0:
             return {
@@ -1326,9 +1243,9 @@ class CellListNLPyTorch(nn.Module):
             }
 
         ind_2 = torch.cat(ind2_list, dim=0).long()
-        shift = torch.cat(shift_list, dim=0).long()
+        shift_out = torch.cat(shift_list, dim=0).long()
 
-        rows = torch.cat([ind_2, shift], dim=1)  # (M,5) = (i, j, sx, sy, sz)
+        rows = torch.cat([ind_2, shift_out], dim=1)  # (M,5)
         rows_uniq = torch.unique(rows, dim=0)
 
         return {"ind_2": rows_uniq[:, :2], "shift": rows_uniq[:, 2:]}
